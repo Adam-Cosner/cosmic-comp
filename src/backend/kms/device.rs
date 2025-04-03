@@ -266,6 +266,7 @@ impl State {
 
         {
             for (conn, maybe_crtc) in connectors {
+                drm_helpers::check_hdr(device.drm.device(), conn)?;
                 match device.connector_added(
                     self.backend.kms().primary_node.as_ref(),
                     conn,

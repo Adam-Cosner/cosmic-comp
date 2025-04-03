@@ -316,3 +316,18 @@ pub fn panel_orientation(dev: &impl ControlDevice, conn: connector::Handle) -> R
         _ => Err(anyhow!("panel orientation has wrong value type")),
     }
 }
+
+pub(crate) fn check_hdr(dev: &impl ControlDevice, conn: connector::Handle) -> Result<bool> {
+    let prop = get_property_val(dev, conn, "HDR_OUTPUT_METADATA");
+    if prop.is_err() {
+        return Ok(false);
+    }
+    let (val_type, val) = prop?;
+    match val_type.convert_value(val) {
+        property::Value::Blob(blob) => {
+            tracing::warn!("HDR Output Metadata had a blob value: {}", blob);
+            Ok(true)
+        }
+        _ => Err(anyhow!("HDR Output Metadata has wrong value type")),
+    }
+}
