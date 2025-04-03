@@ -8,7 +8,7 @@ use crate::{
     wayland::protocols::screencopy::Frame as ScreencopyFrame,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use libc::dev_t;
 use smithay::{
     backend::{
@@ -29,7 +29,7 @@ use smithay::{
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{LoopHandle, RegistrationToken},
-        drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags},
+        drm::control::{atomic, connector, crtc, Device as ControlDevice, ModeTypeFlags},
         gbm::BufferObjectFlags as GbmBufferFlags,
         rustix::fs::OFlags,
         wayland_server::{protocol::wl_buffer::WlBuffer, DisplayHandle, Weak},
@@ -42,6 +42,8 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use super::{drm_helpers, socket::Socket, surface::Surface};
+use smithay::reexports::drm::control;
+use smithay::reexports::drm::control::AtomicCommitFlags;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -510,6 +512,169 @@ impl Device {
         Ok(OutputChanges { added, removed })
     }
 
+    pub fn enable_hdr_output(&mut self, conn: connector::Handle) -> Result<bool> {
+        // Get the CRTC for this output
+        let crtc = match self
+            .surfaces
+            .iter()
+            .find_map(|(crtc, surface)| (surface.connector == conn).then_some(crtc))
+            .cloned()
+        {
+            Some(crtc) => crtc,
+            None => return Err(anyhow!("No CRTC found for this output")),
+        };
+
+        // Get the EDID of this output
+        let edid = drm_helpers::edid_info(self.drm.device(), conn)?;
+        // Get the HDR static metadata of the output
+        let hdr_static_metadata = match edid
+            .edid()
+            .map(|edid| {
+                for extension in edid.extensions() {
+                    if let Some(cta) = libdisplay_info::cta::CTA::from_extension(extension) {
+                        for data_block in cta.data_blocks() {
+                            if let Some(hdr_static_metadata) = data_block.hdr_static_metadata() {
+                                return Some(hdr_static_metadata.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .flatten()
+        {
+            Some(hdr_static_metadata) => hdr_static_metadata,
+            None => return Ok(false),
+        };
+
+        // Create an atomic request to modify the properties by setting colorspace to BT2020 and transfer function to PQ (TODO: LET USERS SET THIS INFORMATION?)
+        if self.supports_atomic {
+            let mut req = atomic::AtomicModeReq::new();
+
+            if let Ok(props) = self.drm.device().get_properties(crtc) {
+                for (handle, value) in props.iter() {
+                    let info = self.drm.device().get_property(*handle)?;
+                    warn!(
+                        "CRTC Property {:?} ({:?}): {:?}",
+                        info.name(),
+                        info.value_type(),
+                        value
+                    );
+                }
+            }
+            if let Ok(props) = self.drm.device().get_properties(conn) {
+                for (handle, value) in props.iter() {
+                    let info = self.drm.device().get_property(*handle)?;
+                    warn!(
+                        "Connector Property {:?} ({:?}): {:?}",
+                        info.name(),
+                        info.value_type(),
+                        value
+                    );
+                }
+            }
+
+            let colorspace_handle = drm_helpers::get_prop(self.drm.device(), conn, "Colorspace")?;
+            let info = self.drm.device().get_property(colorspace_handle)?;
+            req.add_property(
+                conn,
+                colorspace_handle,
+                control::property::Value::Enum(info.value_type().convert_value(9).as_enum()),
+            );
+
+            #[repr(C)]
+            struct drm_hdr_metadata_infoframe {
+                eotf: u8,
+                metadata_type: u8,
+                display_primaries: [[u16; 2]; 3],
+                white_point: [u16; 2],
+                max_display_mastering_luminance: u16,
+                min_display_mastering_luminance: u16,
+                max_content_light_level: u16,
+                max_frame_average_light_level: u16,
+            }
+
+            #[repr(C)]
+            struct drm_hdr_output_metadata {
+                metadata_type: u32,
+                infoframe: drm_hdr_metadata_infoframe,
+            }
+
+            let chromaticity_coords = edid.edid().map(|edid| edid.chromaticity_coords());
+
+            let metadata = drm_hdr_output_metadata {
+                metadata_type: 0,
+                infoframe: drm_hdr_metadata_infoframe {
+                    eotf: 3,
+                    metadata_type: 0,
+                    display_primaries: [
+                        // RED
+                        chromaticity_coords
+                            .map(|chroma| {
+                                [
+                                    (chroma.red_x * 50000.0) as u16,
+                                    (chroma.red_y * 50000.0) as u16,
+                                ]
+                            })
+                            .unwrap_or([0xFA00, 0x3400]),
+                        // GREEN
+                        chromaticity_coords
+                            .map(|chroma| {
+                                [
+                                    (chroma.green_x * 50000.0) as u16,
+                                    (chroma.green_y * 50000.0) as u16,
+                                ]
+                            })
+                            .unwrap_or([0x1500, 0x8C00]),
+                        // BLUE
+                        chromaticity_coords
+                            .map(|chroma| {
+                                [
+                                    (chroma.blue_x * 50000.0) as u16,
+                                    (chroma.blue_y * 50000.0) as u16,
+                                ]
+                            })
+                            .unwrap_or([0x1300, 0x0500]),
+                    ],
+                    white_point: chromaticity_coords
+                        .map(|chroma| {
+                            [
+                                (chroma.white_x * 50000.0) as u16,
+                                (chroma.white_y * 50000.0) as u16,
+                            ]
+                        })
+                        .unwrap_or([0x3A00, 0x3C00]),
+                    max_display_mastering_luminance: hdr_static_metadata
+                        .desired_content_max_luminance
+                        .unwrap_or(1000.0)
+                        as u16,
+                    min_display_mastering_luminance: hdr_static_metadata
+                        .desired_content_min_luminance
+                        .unwrap_or(50.0)
+                        as u16,
+                    max_content_light_level: hdr_static_metadata
+                        .desired_content_max_luminance
+                        .unwrap_or(1000.0) as u16,
+                    max_frame_average_light_level: hdr_static_metadata
+                        .desired_content_max_frame_avg_luminance
+                        .unwrap_or(400.0) as u16,
+                },
+            };
+
+            let blob_id = self.drm.device().create_property_blob(&metadata)?;
+
+            let hdr_static_handle =
+                drm_helpers::get_prop(self.drm.device(), conn, "HDR_OUTPUT_METADATA")?;
+            req.add_property(conn, hdr_static_handle, blob_id);
+
+            self.drm
+                .device()
+                .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)?;
+        }
+
+        Ok(true)
+    }
+
     pub fn connector_added(
         &mut self,
         primary_node: Option<&DrmNode>,
@@ -605,6 +770,12 @@ impl Device {
                     .unwrap()
                     .borrow_mut()
                     .enabled = OutputState::Disabled;
+            }
+
+            match self.enable_hdr_output(conn) {
+                Ok(true) => warn!("Output HDR enabled"),
+                Ok(false) => warn!("Output not supported on connector"),
+                Err(e) => warn!("Failed to enable HDR on output: {}", e),
             }
 
             Ok((output, true))
@@ -741,19 +912,6 @@ fn create_output_for_conn(drm: &mut DrmDevice, conn: connector::Handle) -> Resul
         .inspect_err(|err| warn!(?err, "failed to get EDID for {}", interface))
         .ok();
 
-    edid_info.as_ref().map(|info| {
-        info.edid().map(|edid| {
-            for extension in edid.extensions() {
-                if let Some(cta) = libdisplay_info::cta::CTA::from_extension(extension) {
-                    for data_block in cta.data_blocks() {
-                        if let Some(hdr_static_metadata) = data_block.hdr_static_metadata() {
-                            warn!("HDR Static Metadata: {:?}", hdr_static_metadata);
-                        }
-                    }
-                }
-            }
-        })
-    });
     let (phys_w, phys_h) = conn_info.size().unwrap_or((0, 0));
 
     let output = Output::new(
