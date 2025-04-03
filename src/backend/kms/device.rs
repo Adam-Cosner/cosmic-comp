@@ -41,6 +41,7 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
+use super::{drm_helpers, socket::Socket, surface::Surface};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -48,8 +49,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, mpsc::Receiver, Arc, RwLock},
 };
-
-use super::{drm_helpers, socket::Socket, surface::Surface};
 
 #[derive(Debug)]
 pub struct EGLInternals {
@@ -266,7 +265,6 @@ impl State {
 
         {
             for (conn, maybe_crtc) in connectors {
-                drm_helpers::check_hdr(device.drm.device(), conn)?;
                 match device.connector_added(
                     self.backend.kms().primary_node.as_ref(),
                     conn,
@@ -742,6 +740,20 @@ fn create_output_for_conn(drm: &mut DrmDevice, conn: connector::Handle) -> Resul
     let edid_info = drm_helpers::edid_info(drm, conn)
         .inspect_err(|err| warn!(?err, "failed to get EDID for {}", interface))
         .ok();
+
+    edid_info.as_ref().map(|info| {
+        info.edid().map(|edid| {
+            for extension in edid.extensions() {
+                if let Some(cta) = libdisplay_info::cta::CTA::from_extension(extension) {
+                    for data_block in cta.data_blocks() {
+                        if let Some(hdr_static_metadata) = data_block.hdr_static_metadata() {
+                            warn!("HDR Static Metadata: {:?}", hdr_static_metadata);
+                        }
+                    }
+                }
+            }
+        })
+    });
     let (phys_w, phys_h) = conn_info.size().unwrap_or((0, 0));
 
     let output = Output::new(
